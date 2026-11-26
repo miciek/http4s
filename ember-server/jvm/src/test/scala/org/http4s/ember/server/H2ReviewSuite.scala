@@ -19,10 +19,16 @@ package org.http4s.ember.server
 import cats.effect._
 import cats.syntax.all._
 import com.comcast.ip4s._
+import fs2.Chunk
 import fs2.Stream
+import fs2.io.net.Network
+import fs2.io.net.Socket
 import org.http4s._
 import org.http4s.ember.client.EmberClientBuilder
+import org.http4s.ember.core.h2.H2Frame
+import org.http4s.ember.core.h2.H2Server
 import org.http4s.h2.H2Keys.Http2PriorKnowledge
+import org.typelevel.log4cats.noop.NoOpFactory
 
 import java.util.concurrent.CancellationException
 import scala.concurrent.duration._
@@ -199,6 +205,57 @@ class H2ReviewSuite extends Http4sSuite {
         }
       }
       (startAndKillServer, runClient).parTupled
+    }
+  }
+
+  test("request sent right after server closes idle connection opens a fresh connection") {
+    val app = HttpApp[IO](_ => Response[IO](Status.Ok).withEntity("ok").pure[IO])
+    val settings = H2Frame.Settings.ConnectionSettings.default
+    val goAway = Chunk.byteVector(H2Frame.toByteVector(H2Frame.GoAway(0, 1, 0, None)))
+
+    // Simulates an AWS ALB closing an idle HTTP/2 connection with GOAWAY + TCP FIN
+    // while continuing to accept fresh connections.
+    val server = for {
+      logger <- Resource.eval(NoOpFactory[IO].fromClass(classOf[H2ReviewSuite]))
+      listener <- Network[IO].bind(SocketAddress(ip"127.0.0.1", port"0"))
+      closeFirst <- Resource.eval(Deferred[IO, Unit])
+      serve = (socket: Socket[IO]) =>
+        H2Server.requireConnectionPreface(socket, 5.seconds) >>
+          H2Server.fromSocket(socket, app, Duration.Inf, 60.seconds, settings, logger).useForever
+      _ <- listener.accept.zipWithIndex
+        .evalMap {
+          case (socket, 0L) =>
+            // Serve the first connection normally until triggered, then send GOAWAY + TCP FIN.
+            serve(socket).race(closeFirst.get) >>
+              socket.write(goAway) >>
+              socket.endOfOutput
+          case (socket, _) =>
+            // Serve any subsequent (reconnected) connections normally.
+            serve(socket)
+        }
+        .handleErrorWith(_ => Stream.empty)
+        .compile
+        .drain
+        .background
+      uri = Uri.unsafeFromString(s"http://127.0.0.1:${listener.address.asIpUnsafe.port.value}/")
+      // Brief pause so the client's readLoop observes GOAWAY + EOF before the 1s reaper runs.
+      closeFirstConnection = closeFirst.complete(()) >> IO.sleep(50.millis)
+    } yield (uri, closeFirstConnection)
+
+    val underTest = EmberClientBuilder.default[IO].withHttp2.build
+
+    (server, underTest).tupled.use { case ((uri, closeFirstConnection), client) =>
+      val request = Request[IO](Method.GET, uri).withAttribute(Http2PriorKnowledge, ())
+
+      for {
+        // Given an HTTP/2 client with an open connection established by an earlier request
+        _ <- client.expect[String](request).timeout(2.seconds).assertEquals("ok")
+        // And the server closes that idle connection (GOAWAY + TCP FIN)
+        _ <- closeFirstConnection
+        // When the client immediately sends another request
+        response <- client.expect[String](request).timeout(2.seconds)
+        // Then the client opens a fresh connection and receives the response
+      } yield assertEquals(response, "ok")
     }
   }
 }
